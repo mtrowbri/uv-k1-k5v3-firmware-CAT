@@ -54,6 +54,9 @@
     #include "frequencies.h"
     #include "radio.h"
     #include "ui/ui.h" 
+    #include "scanner.h" // for filling in the IF command response
+    #include "dcs.h" // for filling in the IF command response
+    #include "chFrScanner.h" // for filling in the IF command response
 #endif
 
 #if defined(ENABLE_OVERLAY)
@@ -211,6 +214,25 @@ typedef union
 // --- CAT PROTOCOL VARIABLES ---
 static char cat_buffer[64];
 static uint8_t cat_pos = 0;
+
+// Kenwood TS-480 only supports a subset of the Quansheng CTCSS frequencies
+// Ex: index 0 contains 1, so Quansheng CTCSS config index 0 maps to Kenwood index 1
+// -1 means this index doesn't map
+static uint8_t gCatQuanshengToKenwoodCtcssMissingIndices[] = {
+    1, 23, 28, 30, 31, 45, 46, 47, 49
+};
+
+uint8_t mapCtcssIndexToKenwood(const uint8_t quanshengIndex)
+{
+  uint8_t skipCount = 0;
+  // Note the 2-clause termination criteria.
+  for (size_t i = 0; i < ARRAY_SIZE(gCatQuanshengToKenwoodCtcssMissingIndices) && quanshengIndex > gCatQuanshengToKenwoodCtcssMissingIndices[i]; ++i, ++skipCount )
+  {
+    if ( quanshengIndex == gCatQuanshengToKenwoodCtcssMissingIndices[i] )
+      return -1; // a Quansheng CTCSS tone that Kenwood TS-480 CAT spec doesn't support
+  }
+  return quanshengIndex - skipCount;
+}
 
 // --- CAT HELPER FUNCTIONS ---
 
@@ -441,6 +463,9 @@ static void Process_Kenwood_CAT(uint32_t Port) {
     }
 
     // 9. CT (Set CTCSS Tone)
+    // TODO Use gCatQuanshengToKenwoodCtcssMissingIndices to support the 2-digit
+    // CTCSS code indices from the TS-480 command manual
+    // (when it starts with CT and 7 > cat_pos >= 5)
     if (strncmp(cat_buffer, "CT", 2) == 0 && cat_pos >= 7) {
         uint32_t ct_freq = TextToUInt(cat_buffer, 2, 4);
         for (uint8_t i = 0; i < 50; i++) {
@@ -510,18 +535,89 @@ static void Process_Kenwood_CAT(uint32_t Port) {
         char resp[40]; memset(resp, ' ', 38);
         resp[0] = 'I'; resp[1] = 'F';
         
+        // Used to make decisions for P7, P8, P10
+        bool is_tx = (gCurrentFunction == FUNCTION_TRANSMIT);
+        bool isActiveVfoInFreqMode = (gEeprom.ScreenChannel[gEeprom.TX_VFO] == gEeprom.FreqChannel[gEeprom.TX_VFO]);
+
         uint32_t freqHz = 0;
         if(gTxVfo) freqHz = gTxVfo->pRX->Frequency * 10;
         else freqHz = gEeprom.VfoInfo[gEeprom.TX_VFO].pRX->Frequency * 10;
 
         UIntToText(resp, freqHz, 11, 2);
-        resp[13]='0'; resp[14]='0'; resp[15]='0'; resp[16]='0'; resp[17]='0';
+        // Command manual says P2 (the next 5 characters) should be spaces:leave as initialized.
+        // P3: RIT/XIT frequency: 5 places.  4 digits + (sign or 0)?
+        resp[18]='0'; resp[19]='0'; resp[20]='0'; resp[21]='0'; resp[22]='0';
+
+        // P4: RIT: 0 off, 1 on
+        resp[23] = '0';
+
+        // P5: XIT: 0 off, 1 on
+        resp[24] = '0';
+
+        // P6: always 0 (memory channel bank number)
+        resp[25] = '0';
+
+        // P7: memory channel.
+        // We have 1000 memory channels but the message only fits 00-99.
+        // Relying on UIntToText going backwards from last 2 digits
+        // Assumption: it's ok to put a memory channel if we're in VFO mode
+        UIntToText(resp, gEeprom.MrChannel[gEeprom.TX_VFO], 2, 26);
+
+        // P8: Mode. 0 for RX, 1 for TX.
+        resp[28] = is_tx ? '1' : '0';
+
+        // P9: modulation/operating mode
+        switch(gEeprom.VfoInfo[gEeprom.TX_VFO].Modulation)
+        {
+          case MODULATION_FM: resp[29] = '4'; break;
+          case MODULATION_AM: resp[29] = '5'; break;
+          case MODULATION_USB: resp[29] = '2'; break;
+          default: resp[29] = '0'; // not used for TS-480, technically a bug if we do this
+        }
+
+        // P10: which is active: (0: VFO A, 1: VFO B, 2: channel memory)?
+        // Assumption: since the field is one character and the FR/FT
+        // commands each use 1 char, we should choose
+        // either the TX or RX (but only one) based on P8/is_tx
+        if ( isActiveVfoInFreqMode )
+        {
+          // 0: VFO A, 1: VFO B
+          resp[30] = '0' + gEeprom.TX_VFO;
+        }
+        else
+          resp[30] = '2'; // 2: memory channel mode
+
+        // P11: scan status
+        if ( SCAN_OFF == gScanStateDir )
+          resp[31] = '0';
+        else if ( SCAN_CSS_STATE_OFF == gScanCssState )
+          resp[31] = '1'; // Scanning for squelch breaks, but not CTCSS/DCS
+        else
+          resp[31] = '5'; // 4: Tone scan ON, 5: CTCSS Scan on.
+
+        // P12: 0: simplex, 1: split
+        resp[32] = ( CROSS_BAND_OFF == gEeprom.CROSS_BAND_RX_TX ? '0' : '1' );
+
+        // P13 & P14 are coupled.
+        // P13: 0 for no tones, 1 for DCS, 2 for CTCSS
+        // P14: 2 digits of tone number
+        switch(gCurrentVfo->pTX->CodeType)
+        {
+          case CODE_TYPE_OFF:
+            resp[33] = '0'; // P13
+            resp[34] = '0'; resp[35] = '0'; // P14
+            break;
+          case CODE_TYPE_CONTINUOUS_TONE:
+            resp[33] = '2'; // P13
+            UIntToText(resp, mapCtcssIndexToKenwood(gCurrentVfo->pTX->Code), 2, 34); // P14
+            break;
+          default:
+            resp[33] = '1'; // either forward or reverse DCS
+            resp[34] = '0'; resp[35] = '0'; // P14
+        }
         
-        uint8_t mod = gEeprom.VfoInfo[gEeprom.TX_VFO].Modulation;
-        resp[29] = (mod == 1) ? '5' : '4'; 
-        bool is_tx = (gCurrentFunction == FUNCTION_TRANSMIT);
-        resp[30] = is_tx ? '1' : '0';
-        resp[31] = ';'; resp[32] = 0;
+        // P15 (resp[36]: always a space for TS-480; leave as initialized.
+        resp[37] = ';'; resp[38] = 0;
         UART_SendText(Port, resp);
         return;
     }
