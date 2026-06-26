@@ -49,6 +49,7 @@
 #include "version.h"
 
 #ifdef ENABLE_CAT
+    #include "cat.h"
     #include "dcs.h"        // Access to CTCSS/DCS tables
     #include "app/action.h" // Access to ACTION_Monitor()
     #include "frequencies.h"
@@ -252,22 +253,7 @@ void UART_SendText(uint32_t Port, const char *str) {
 #endif
 }
 
-void UIntToText(char* buffer, uint32_t value, int digits, int offset) {
-    for (int i = offset + digits - 1; i >= offset; i--) {
-        buffer[i] = (value % 10) + '0';
-        value /= 10;
-    }
-}
 
-uint32_t TextToUInt(const char* buffer, int start, int len) {
-    uint32_t val = 0;
-    for (int i = start; i < start + len; i++) {
-        if (buffer[i] >= '0' && buffer[i] <= '9') {
-            val = (val * 10) + (buffer[i] - '0');
-        }
-    }
-    return val;
-}
 
 uint16_t ParseDCSCode(const char* buffer, int start) {
     uint16_t val = 0;
@@ -537,11 +523,12 @@ static void Process_Kenwood_CAT(uint32_t Port) {
         
         // Used to make decisions for P7, P8, P10
         bool is_tx = (gCurrentFunction == FUNCTION_TRANSMIT);
-        bool isActiveVfoInFreqMode = (gEeprom.ScreenChannel[gEeprom.TX_VFO] == gEeprom.FreqChannel[gEeprom.TX_VFO]);
+        const uint8_t activeVfo = is_tx ? gEeprom.TX_VFO : gEeprom.RX_VFO;
+        bool isActiveVfoInFreqMode = (gEeprom.ScreenChannel[activeVfo] == gEeprom.FreqChannel[activeVfo]);
 
         uint32_t freqHz = 0;
         if(gTxVfo) freqHz = gTxVfo->pRX->Frequency * 10;
-        else freqHz = gEeprom.VfoInfo[gEeprom.TX_VFO].pRX->Frequency * 10;
+        else freqHz = gEeprom.VfoInfo[activeVfo].pRX->Frequency * 10;
 
         UIntToText(resp, freqHz, 11, 2);
         // Command manual says P2 (the next 5 characters) should be spaces:leave as initialized.
@@ -561,13 +548,13 @@ static void Process_Kenwood_CAT(uint32_t Port) {
         // We have 1000 memory channels but the message only fits 00-99.
         // Relying on UIntToText going backwards from last 2 digits
         // Assumption: it's ok to put a memory channel if we're in VFO mode
-        UIntToText(resp, gEeprom.MrChannel[gEeprom.TX_VFO], 2, 26);
+        UIntToText(resp, gEeprom.MrChannel[activeVfo], 2, 26);
 
         // P8: Mode. 0 for RX, 1 for TX.
         resp[28] = is_tx ? '1' : '0';
 
         // P9: modulation/operating mode
-        switch(gEeprom.VfoInfo[gEeprom.TX_VFO].Modulation)
+        switch(gEeprom.VfoInfo[activeVfo].Modulation)
         {
           case MODULATION_FM: resp[29] = '4'; break;
           case MODULATION_AM: resp[29] = '5'; break;
@@ -582,7 +569,7 @@ static void Process_Kenwood_CAT(uint32_t Port) {
         if ( isActiveVfoInFreqMode )
         {
           // 0: VFO A, 1: VFO B
-          resp[30] = '0' + gEeprom.TX_VFO;
+          resp[30] = '0' + activeVfo;
         }
         else
           resp[30] = '2'; // 2: memory channel mode
@@ -620,6 +607,31 @@ static void Process_Kenwood_CAT(uint32_t Port) {
         resp[37] = ';'; resp[38] = 0;
         UART_SendText(Port, resp);
         return;
+    }
+
+    // 15. Audio filter bandwidth (MAT)
+    if (strncmp(cat_buffer, "FW", 2) == 0) {
+      handleCatsFW(cat_buffer, cat_pos, Port);
+    }
+
+    // 16. Power state/sleep mode
+    if (strncmp(cat_buffer, "PS", 2) == 0) {
+      handleCatsPS(cat_buffer, cat_pos, Port);
+    }
+
+    // 17. Automated IF responses
+    if (strncmp(cat_buffer, "AI", 2) == 0) {
+      handleCatsAI(cat_buffer, cat_pos, Port);
+    }
+
+    // 18. Morse keyer speed
+    if (strncmp(cat_buffer, "KS", 2) == 0) {
+      handleCatsKS(cat_buffer, cat_pos, Port);
+    }
+
+    // 18. Read the SWR, compression and automatic level control meters we don't have
+    if (strncmp(cat_buffer, "RM", 2) == 0) {
+      handleCatsRM(cat_buffer, cat_pos, Port);
     }
 }
 #endif // ENABLE_CAT

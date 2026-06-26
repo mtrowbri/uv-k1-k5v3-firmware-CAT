@@ -108,10 +108,21 @@ if(ENABLE_USB)
     )
 endif()
 
+
 if(ENABLE_UART OR ENABLE_USB)
     target_sources(App INTERFACE 
         app/uart.c
     )
+endif()
+
+enable_feature(ENABLE_CAT
+    app/cat.c
+)
+
+if(ENABLE_CAT)
+    target_sources(App INTERFACE 
+        app/cat.c
+    )  
 endif()
 
 # ---- STOCK QUANSHENG FEATURES ----
