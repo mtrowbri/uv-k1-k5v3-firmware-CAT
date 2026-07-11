@@ -210,7 +210,7 @@ typedef union
 #ifdef ENABLE_CAT
 
 // --- CAT PROTOCOL VARIABLES ---
-static char cat_buffer[64];
+static char cat_buffer[CAT_BUFFER_SIZE];
 static uint8_t cat_pos = 0;
 
 // Kenwood TS-480 only supports a subset of the Quansheng CTCSS frequencies
@@ -270,29 +270,6 @@ void ForceScreenUpdate(void) {
     #endif
 }
 
-// Bypasses the keypad ProcessKey() loop to apply and permanently save settings immediately
-void CAT_ApplyAndSave(bool bIsGlobal) {
-    if (bIsGlobal) {
-        // Global settings like Squelch
-        SETTINGS_SaveSettings();
-        RADIO_ConfigureChannel(gEeprom.TX_VFO, VFO_CONFIGURE);
-    } else {
-        // VFO specific settings like Offset, Tone, Power
-        SETTINGS_SaveChannel(gEeprom.VfoInfo[gEeprom.TX_VFO].CHANNEL_SAVE, gEeprom.TX_VFO, &gEeprom.VfoInfo[gEeprom.TX_VFO], 1);
-        RADIO_ConfigureChannel(gEeprom.TX_VFO, VFO_CONFIGURE_RELOAD);
-    }
-    
-    if (gRxIdleMode) {
-        BK4819_RX_TurnOn();
-        gRxIdleMode = false;
-    }
-
-    // Apply changes to hardware immediately
-    RADIO_SelectVfos();
-    RADIO_SetupRegisters(true);
-    ForceScreenUpdate();
-}
-
 void Apply_Tone_To_Active_VFO(uint8_t code_type, uint8_t code_index) {
     gEeprom.VfoInfo[gEeprom.TX_VFO].pTX->CodeType = code_type;
     gEeprom.VfoInfo[gEeprom.TX_VFO].pTX->Code = code_index;
@@ -321,26 +298,7 @@ static void Process_Kenwood_CAT(uint32_t Port) {
     bool is_fa = (strncmp(cat_buffer, "FA", 2) == 0);
     bool is_fb = (strncmp(cat_buffer, "FB", 2) == 0);
     if (is_fa || is_fb) {
-        int vfo_idx = is_fa ? 0 : 1; 
-        if (cat_buffer[2] == ';') { // GET Frequency
-            uint32_t freqHz = gEeprom.VfoInfo[vfo_idx].pRX->Frequency * 10;
-            char resp[16];
-            resp[0] = 'F'; resp[1] = is_fa ? 'A' : 'B';
-            UIntToText(resp, freqHz, 11, 2);
-            resp[13] = ';'; resp[14] = 0;
-            UART_SendText(Port, resp);
-        } else if (cat_pos >= 13) { // SET Frequency
-            uint32_t freqHz = TextToUInt(cat_buffer, 2, 11);
-            if (gEeprom.VfoInfo[vfo_idx].pRX->Frequency != freqHz / 10) {
-                gEeprom.VfoInfo[vfo_idx].pRX->Frequency = freqHz / 10;
-                gEeprom.VfoInfo[vfo_idx].pTX->Frequency = freqHz / 10;
-                if (gEeprom.TX_VFO == vfo_idx) {
-                    CAT_ApplyAndSave(false);
-                } else {
-                    SETTINGS_SaveChannel(gEeprom.VfoInfo[vfo_idx].CHANNEL_SAVE, vfo_idx, &gEeprom.VfoInfo[vfo_idx], 1);
-                }
-            }
-        }
+        handleCatsFAFB(cat_buffer, cat_pos, Port, true); // true: allow deferral
         return;
     }
 

@@ -44,6 +44,10 @@
     #include "app/uart.h"
     #include "scheduler.h"
 #endif
+#ifdef ENABLE_CAT
+    // For handing deferred CAT frequency change commands that arrived during transmission
+    #include "app/cat.h"
+#endif
 #include "py32f0xx.h"
 #include "audio.h"
 #include "board.h"
@@ -1049,6 +1053,10 @@ void APP_HandleEndTransmission(void) {
         else
             gRTTECountdown_10ms = gEeprom.REPEATER_TAIL_TONE_ELIMINATION * 10;
     }
+
+#ifdef ENABLE_CAT
+    handleDeferredCatsFAFB();
+#endif
 
     gFlagEndTransmission = false;
 }

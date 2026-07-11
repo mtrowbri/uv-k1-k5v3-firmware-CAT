@@ -5,6 +5,8 @@
  *      Author: mtrowbri
  */
 
+#include <string.h>
+
 #include "cat.h"
 
 #include "driver/bk4819.h"
@@ -12,6 +14,10 @@
 
 #include "uart.h" // for UART_SendText
 #include "functions.h"
+#include "settings.h" // for gEeprom
+#include "misc.h" // for VFO_CONFIGURE
+
+static char deferred_freq_command[CAT_BUFFER_SIZE];
 
 // Helper functions
 void UIntToText(char* buffer, uint32_t value, int digits, int offset) {
@@ -29,6 +35,29 @@ uint32_t TextToUInt(const char* buffer, int start, int len) {
         }
     }
     return val;
+}
+
+// Bypasses the keypad ProcessKey() loop to apply and permanently save settings immediately
+void CAT_ApplyAndSave(bool bIsGlobal) {
+    if (bIsGlobal) {
+        // Global settings like Squelch
+        SETTINGS_SaveSettings();
+        RADIO_ConfigureChannel(gEeprom.TX_VFO, VFO_CONFIGURE);
+    } else {
+        // VFO specific settings like Offset, Tone, Power
+        SETTINGS_SaveChannel(gEeprom.VfoInfo[gEeprom.TX_VFO].CHANNEL_SAVE, gEeprom.TX_VFO, &gEeprom.VfoInfo[gEeprom.TX_VFO], 1);
+        RADIO_ConfigureChannel(gEeprom.TX_VFO, VFO_CONFIGURE_RELOAD);
+    }
+
+    if (gRxIdleMode) {
+        BK4819_RX_TurnOn();
+        gRxIdleMode = false;
+    }
+
+    // Apply changes to hardware immediately
+    RADIO_SelectVfos();
+    RADIO_SetupRegisters(true);
+    ForceScreenUpdate();
 }
 
 void applyAudioFilter( const KenwoodAudioFilterBw_t audioBandwidth)
@@ -120,4 +149,70 @@ void handleCatsRM(char *cat_buffer, const uint8_t cat_pos, const uint32_t port)
   // TODO we could probably implement the ALC part of this command
   char resp[] = "RM10000;RM20000;RM30000;"; // rigctl seems to think this is correct
   UART_SendText(port, resp);
+}
+
+void handleCatsFAFB(char *cat_buffer, const uint8_t cat_pos, const uint32_t port, const bool allowDeferral)
+{
+  // Also done in Process_Kenwood_CAT, but must be redone here for the
+  // deferred (due to PTT depressed) case.
+  bool is_fa = (strncmp(cat_buffer, "FA", 2) == 0);
+  bool is_fb = (strncmp(cat_buffer, "FB", 2) == 0);
+  if (is_fa || is_fb)
+  {
+    int vfo_idx = is_fa ? 0 : 1;
+    if (cat_buffer[2] == ';')
+    { // GET Frequency
+      uint32_t freqHz = gEeprom.VfoInfo[vfo_idx].pRX->Frequency * 10;
+      char resp[16];
+      resp[0] = 'F';
+      resp[1] = is_fa ? 'A' : 'B';
+      UIntToText(resp, freqHz, 11, 2);
+      resp[13] = ';';
+      resp[14] = 0;
+      UART_SendText(port, resp);
+    }
+    else if (cat_pos >= 13)
+    { // SET Frequency
+      if (FUNCTION_TRANSMIT == gCurrentFunction && allowDeferral)
+      {
+        // defer the command until after PTT gets released
+        memset(deferred_freq_command, 0x00, CAT_BUFFER_SIZE);
+        memcpy(deferred_freq_command, cat_buffer, cat_pos);
+      }
+      else
+      {
+        // Do it now
+        uint32_t freqHz = TextToUInt(cat_buffer, 2, 11);
+        if (gEeprom.VfoInfo[vfo_idx].pRX->Frequency != freqHz / 10)
+        {
+          gEeprom.VfoInfo[vfo_idx].pRX->Frequency = freqHz / 10;
+          gEeprom.VfoInfo[vfo_idx].pTX->Frequency = freqHz / 10;
+          if (gEeprom.TX_VFO == vfo_idx)
+          {
+            CAT_ApplyAndSave(false);
+          }
+          else
+          {
+            SETTINGS_SaveChannel(gEeprom.VfoInfo[vfo_idx].CHANNEL_SAVE, vfo_idx,
+                                 &gEeprom.VfoInfo[vfo_idx], 1);
+          }
+        }
+      }
+    }
+  }
+}
+
+void handleDeferredCatsFAFB()
+{
+  // Zero length (i.e. char 0 is 0x00) means unset/no deferred command
+  uint8_t length = strlen(deferred_freq_command);
+  if (length > 0)
+  {
+    // only frequency set commands may be deferred and set commands don't use port
+    // false: don't defer, do it now
+    handleCatsFAFB(deferred_freq_command, length, 0, false);
+
+    // Reset the buffer/unset the deferred command store
+    memset(deferred_freq_command, 0x00, CAT_BUFFER_SIZE);
+  }
 }

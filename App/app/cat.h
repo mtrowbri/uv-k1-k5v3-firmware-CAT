@@ -8,12 +8,17 @@
 #ifndef APP_CAT_H_
 #define APP_CAT_H_
 
+#define CAT_BUFFER_SIZE 64
+
 #include <stdint.h>
+#include <stdbool.h>
 
 // Helper functions
 void UIntToText(char *buffer, uint32_t value, int digits, int offset);
 
 uint32_t TextToUInt(const char *buffer, int start, int len);
+
+void CAT_ApplyAndSave(bool bIsGlobal);
 
 /**
  * Enumeration for the Kenwood TS-480 audio filter settings as they apply to the BK4819 REG43.
@@ -68,5 +73,9 @@ void handleCatsAI(char *cat_buffer, const uint8_t cat_pos, const uint32_t port);
 void handleCatsKS(char *cat_buffer, const uint8_t cat_pos, const uint32_t port);
 
 void handleCatsRM(char *cat_buffer, const uint8_t cat_pos, const uint32_t port);
+
+void handleCatsFAFB(char *cat_buffer, const uint8_t cat_pos, const uint32_t port, const bool allowDeferral);
+
+void handleDeferredCatsFAFB();
 
 #endif /* APP_CAT_H_ */
