@@ -15,9 +15,6 @@
  * limitations under the License.
  */
 
-// FORCE CAT COMPILATION
-#define ENABLE_CAT 1
-
 #include <string.h>
 
 #if !defined(ENABLE_OVERLAY)
