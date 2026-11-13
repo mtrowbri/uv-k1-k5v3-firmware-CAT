@@ -18,7 +18,10 @@
 
 #include "app/app.h"
 #include "app/chFrScanner.h"
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FEAT_F4HWN_RXTX_LOG
+#include "app/rxtx_log.h"
+#endif
+#ifdef ENABLE_FMRADIO_EMBEDDED
     #include "app/fm.h"
 #endif
 #include "app/scanner.h"
@@ -51,6 +54,29 @@ static void convertTime(uint8_t *line, uint8_t type)
 #endif
 #endif
 
+#if defined(ENABLE_FEAT_F4HWN_FOXHUNT) || defined(ENABLE_FEAT_F4HWN_BEACON) || defined(ENABLE_FEAT_F4HWN_OVERLAY_APPS)
+void UI_DrawStatusBattery(uint8_t *line, char *str)
+#else
+static __attribute__((always_inline)) inline void UI_DrawStatusBattery(uint8_t *line, char *str)
+#endif
+{
+    unsigned int x = LCD_WIDTH - sizeof(BITMAP_BatteryLevel1);
+
+    UI_DrawBattery(line + x, gBatteryDisplayLevel, gLowBatteryBlink);
+
+    if (gSetting_battery_text == 1) {
+        const uint16_t voltage = MIN(gBatteryVoltageAverage, 999);
+        sprintf(str, "%u.%02u", voltage / 100, voltage % 100);
+    } else if (gSetting_battery_text == 2) {
+        sprintf(str, "%02u%%", BATTERY_VoltsToPercent(gBatteryVoltageAverage));
+    } else {
+        return;
+    }
+
+    x -= 7 * strlen(str);
+    UI_PrintStringSmallBufferNormal(str, line + x);
+}
+
 void UI_DisplayStatus()
 {
     gUpdateStatus = false;
@@ -66,31 +92,52 @@ void UI_DisplayStatus()
 
     char str[8] = "";
 
+#ifdef ENABLE_FEAT_F4HWN_RXTX_LOG
+    // The filter label reuses the leftmost slot (pixels 2..16) normally
+    // reserved by the power-save and scan indicators; those two are skipped
+    // on the log screen so the rest of the bar keeps its usual layout.
+    const bool isRxTxLogScreen = gScreenToDisplay == DISPLAY_RXTX_LOG;
+    if (isRxTxLogScreen) {
+        const char *filter = RXTX_LOG_GetFilterName();
+        const uint8_t end = (filter[2] == 0) ? 10 : 14;
+
+        GUI_DisplaySmallestInverse(filter, 2, 0, true, true, end);
+    }
+#endif
+
 #if defined(ENABLE_FEAT_F4HWN_RX_TX_TIMER) && !defined(ENABLE_FEAT_F4HWN_DEBUG)
     bool isTransmit = gCurrentFunction == FUNCTION_TRANSMIT;
+#ifdef ENABLE_FEAT_F4HWN_RXTX_LOG
+    if (!isRxTxLogScreen && gSetting_set_tmr && (isTransmit || FUNCTION_IsRx())) {
+#else
     if (gSetting_set_tmr && (isTransmit || FUNCTION_IsRx())) {
+#endif
         convertTime(line, !isTransmit);
         x += 39;
     } else {
 #endif
 
-#ifdef ENABLE_NOAA
-    // NOAA indicator
-    if (!(gScanStateDir != SCAN_OFF || SCANNER_IsScanning()) && gIsNoaaMode) { // NOASS SCAN indicator
-        memcpy(line + x, BITMAP_NOAA, sizeof(BITMAP_NOAA));
-    }
-    // Power Save indicator
-    else if (gCurrentFunction == FUNCTION_POWER_SAVE) {
-        memcpy(line + x, gFontPowerSave, sizeof(gFontPowerSave));
-    }
-    x += 8;
-#else
-    // Power Save indicator
-    if (gCurrentFunction == FUNCTION_POWER_SAVE) {
-        memcpy(line + x, gFontPowerSave, sizeof(gFontPowerSave));
-    }
-    x += 8;
+#ifdef ENABLE_FEAT_F4HWN_RXTX_LOG
+    if (!isRxTxLogScreen)
 #endif
+    {
+#ifdef ENABLE_NOAA
+        // NOAA indicator
+        if (!(gScanStateDir != SCAN_OFF || SCANNER_IsScanning()) && gIsNoaaMode) { // NOASS SCAN indicator
+            memcpy(line + x, BITMAP_NOAA, sizeof(BITMAP_NOAA));
+        }
+        // Power Save indicator
+        else if (gCurrentFunction == FUNCTION_POWER_SAVE) {
+            memcpy(line + x, gFontPowerSave, sizeof(gFontPowerSave));
+        }
+#else
+        // Power Save indicator
+        if (gCurrentFunction == FUNCTION_POWER_SAVE) {
+            memcpy(line + x, gFontPowerSave, sizeof(gFontPowerSave));
+        }
+#endif
+    }
+    x += 8;
 
     x1 = x;
 
@@ -102,7 +149,11 @@ void UI_DisplayStatus()
     else
 #endif
     { // SCAN indicator
-        if (gScanStateDir != SCAN_OFF || SCANNER_IsScanning()) {
+        if ((gScanStateDir != SCAN_OFF || SCANNER_IsScanning())
+#ifdef ENABLE_FEAT_F4HWN_RXTX_LOG
+            && !isRxTxLogScreen
+#endif
+        ) {
             if (IS_MR_CHANNEL(gNextMrChannel) && !SCANNER_IsScanning()) { // channel mode
                 uint8_t end = 0;
 
@@ -286,39 +337,7 @@ void UI_DisplayStatus()
         memcpy(line + x + 1, src, size);
     }
 
-    // Battery
-    unsigned int x2 = LCD_WIDTH - sizeof(BITMAP_BatteryLevel1) - 0;
-
-    UI_DrawBattery(line + x2, gBatteryDisplayLevel, gLowBatteryBlink);
-
-    switch (gSetting_battery_text) {
-        default:
-        case 0:
-            break;
-
-        case 1:     // voltage
-        case 2:     // percentage
-            if (gSetting_battery_text == 1) {
-                const uint16_t voltage = MIN(gBatteryVoltageAverage, 999); // limit to 9.99V
-                sprintf(str, "%u.%02u", voltage / 100, voltage % 100);
-            } else {
-                //gBatteryVoltageAverage = 999;
-                sprintf(str, "%02u%%", BATTERY_VoltsToPercent(gBatteryVoltageAverage));
-            }
-
-            x2 -= (7 * strlen(str));
-            UI_PrintStringSmallBufferNormal(str, line + x2);
-            /*
-            uint8_t shift = (strlen(str) < 5) ? 92 : 88;
-            GUI_DisplaySmallest(str, shift, 1, true, true);
-
-            for (uint8_t i = shift - 2; i < 110; i++) {
-                gStatusLine[i] ^= 0x7F; // invert
-            }
-            */
-            
-            break;
-    }
+    UI_DrawStatusBattery(line, str);
 
     // **************
 

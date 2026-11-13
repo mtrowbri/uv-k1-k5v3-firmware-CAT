@@ -18,7 +18,6 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "am_fix.h"
 #include "app/action.h"
 
 #ifdef ENABLE_AIRCOPY
@@ -33,12 +32,15 @@
 #ifdef ENABLE_FLASHLIGHT
     #include "app/flashlight.h"
 #endif
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
     #include "app/fm.h"
 #endif
 #include "app/generic.h"
 #include "app/main.h"
 #include "app/menu.h"
+#ifdef ENABLE_FEAT_F4HWN_RXTX_LOG
+    #include "app/rxtx_log.h"
+#endif
 #include "app/scanner.h"
 #if defined(ENABLE_UART) || defined(ENABLE_USB)
     #include "app/uart.h"
@@ -55,7 +57,7 @@
     // #include "bsp/dp32g030/pwmplus.h"
 #endif
 #include "driver/backlight.h"
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
     #include "driver/bk1080.h"
 #endif
 #include "driver/bk4819.h"
@@ -84,8 +86,8 @@
 #include "ui/ui.h"
 #include "ui/welcome.h"
 
-#ifdef ENABLE_FEAT_F4HWN_SCREENSHOT
-    #include "screenshot.h"
+#ifdef ENABLE_FEAT_F4HWN_K5VIEWER
+    #include "k5viewer.h"
 #endif
 
 static bool flagSaveVfo;
@@ -108,26 +110,29 @@ static KEY_Code_t gScreenSaverWakeKey = KEY_INVALID;
 static void ProcessKey(KEY_Code_t Key, bool bKeyPressed, bool bKeyHeld);
 
 
-void (*ProcessKeysFunctions[])(KEY_Code_t Key, bool bKeyPressed, bool bKeyHeld) = {
+void (*const ProcessKeysFunctions[])(KEY_Code_t Key, bool bKeyPressed, bool bKeyHeld) = {
     [DISPLAY_MAIN] = &MAIN_ProcessKeys,
     [DISPLAY_MENU] = &MENU_ProcessKeys,
     [DISPLAY_SCANNER] = &SCANNER_ProcessKeys,
 
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
     [DISPLAY_FM] = &FM_ProcessKeys,
+#elif defined(ENABLE_FMRADIO)
+    /* The modal FM overlay handles its own keys. Keep the enum slot populated
+       for configurations where DISPLAY_FM is the final display entry. */
+    [DISPLAY_FM] = &MAIN_ProcessKeys,
 #endif
 
 #ifdef ENABLE_AIRCOPY
     [DISPLAY_AIRCOPY] = &AIRCOPY_ProcessKeys,
 #endif
+
+#ifdef ENABLE_FEAT_F4HWN_RXTX_LOG
+    [DISPLAY_RXTX_LOG] = &RXTX_LOG_ProcessKeys,
+#endif
 };
 
-#ifdef ENABLE_REGA
-// This is a hack for REGA as I need a special display element only for it with no key
-static_assert(ARRAY_SIZE(ProcessKeysFunctions) == DISPLAY_N_ELEM-1);
-#else
 static_assert(ARRAY_SIZE(ProcessKeysFunctions) == DISPLAY_N_ELEM);
-#endif
 
 #ifdef ENABLE_FEAT_F4HWN_LOGO_SAV
 static uint8_t ScreenSaverRandom(void)
@@ -232,12 +237,12 @@ static void ScreenSaverRenderLogoPlus(bool reset)
 
 static void ScreenSaverUpdateViewer(void)
 {
-#ifdef ENABLE_FEAT_F4HWN_SCREENSHOT
-    SCREENSHOT_Update(false);
+#ifdef ENABLE_FEAT_F4HWN_K5VIEWER
+    K5VIEWER_Update(false);
 #endif
 }
 
-static bool ScreenSaverCanDisplay(void)
+static bool ScreenSaverCanDisplay(bool modal)
 {
     if (gSetting_set_sav == SET_SAV_OFF ||
         gEeprom.BACKLIGHT_TIME == 0 ||
@@ -249,7 +254,7 @@ static bool ScreenSaverCanDisplay(void)
         gCurrentFunction == FUNCTION_TRANSMIT ||
         FUNCTION_IsRx() ||
         gPttIsPressed
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
         || (gFM_ScanState != FM_SCAN_OFF && !gFM_FoundFrequency)
 #endif
 #ifdef ENABLE_FEAT_F4HWN_BEAM
@@ -260,10 +265,10 @@ static bool ScreenSaverCanDisplay(void)
         return false;
     }
 
-    if (gScreenToDisplay == DISPLAY_MAIN)
+    if (modal || gScreenToDisplay == DISPLAY_MAIN)
         return true;
 
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
     if (gScreenToDisplay == DISPLAY_FM)
         return true;
 #endif
@@ -271,9 +276,9 @@ static bool ScreenSaverCanDisplay(void)
     return false;
 }
 
-static void ScreenSaverTryDisplay(void)
+static void ScreenSaverTryDisplay(bool modal)
 {
-    if (!ScreenSaverCanDisplay())
+    if (!ScreenSaverCanDisplay(modal))
         return;
 
     if (gSetting_set_sav == SET_SAV_LOGO)
@@ -298,6 +303,28 @@ static void ScreenSaverExit(void)
         gUpdateStatus = true;
     }
 }
+
+static bool ScreenSaverAnimate(void)
+{
+    if (!gScreenSaverDisplayed)
+        return false;
+
+    if (gSetting_set_sav == SET_SAV_MATRIX) {
+        if (++gScreenSaverTick >= 8u) {
+            gScreenSaverTick = 0;
+            ScreenSaverRenderMatrix(false);
+            return true;
+        }
+    } else if (gSetting_set_sav == SET_SAV_LOGO_PLUS) {
+        if (++gScreenSaverTick >= 16u) {
+            gScreenSaverTick = 0;
+            ScreenSaverRenderLogoPlus(false);
+            return true;
+        }
+    }
+
+    return false;
+}
 #endif
 
 bool APP_IsScreenSaverDisplayed(void)
@@ -309,10 +336,58 @@ bool APP_IsScreenSaverDisplayed(void)
 #endif
 }
 
+/* Modal foreground loops (resident tools and overlay apps) bypass APP_Update()
+ * and therefore also bypass the normal 10 ms fade and 500 ms BLTime service.
+ * Keep that service resident so every overlay app gets identical timing without
+ * extending the app ABI.  Only selected modal screens opt into the saver; the
+ * others still fade from BLMax to BLMin when BLTime expires. */
+void APP_ModalBacklightTick(bool allowScreenSaver)
+{
+    if (gNextTimeslice) {
+        gNextTimeslice = false;
+        BACKLIGHT_Update();
+
+#ifdef ENABLE_FEAT_F4HWN_LOGO_SAV
+        if (ScreenSaverAnimate())
+            ScreenSaverUpdateViewer();
+#endif
+    }
+
+    if (!gNextTimeslice_500ms)
+        return;
+    gNextTimeslice_500ms = false;
+
+    if (gBacklightCountdown_500ms > 0 &&
+        gEeprom.BACKLIGHT_TIME < 61 &&
+        --gBacklightCountdown_500ms == 0)
+        BACKLIGHT_TurnOff();
+
+#ifdef ENABLE_FEAT_F4HWN_LOGO_SAV
+    if (allowScreenSaver && gBacklightCountdown_500ms == 0)
+        ScreenSaverTryDisplay(true);
+#else
+    (void)allowScreenSaver;
+#endif
+}
+
+void APP_ModalScreenSaverExit(void)
+{
+#ifdef ENABLE_FEAT_F4HWN_LOGO_SAV
+    ScreenSaverExit();
+#endif
+}
+
 static void CheckForIncoming(void)
 {
     if (!g_SquelchLost)
         return;          // squelch is closed
+
+#ifdef ENABLE_FMRADIO_EMBEDDED
+    // FM scan in progress: ignore main-channel RX so scanning is not interrupted.
+    // Normal FM listening (FM_SCAN_OFF) still yields to channel signals as before.
+    if (gFmRadioMode && gFM_ScanState != FM_SCAN_OFF)
+        return;
+#endif
 
 #ifdef ENABLE_FEAT_F4HWN_LOGO_SAV
     ScreenSaverExit();
@@ -444,6 +519,12 @@ static void HandleIncoming(void)
             return;
         }
     }
+#endif
+
+#ifdef ENABLE_FMRADIO_EMBEDDED
+    // Defensive: do not leave FM scan for a main-channel signal.
+    if (gFmRadioMode && gFM_ScanState != FM_SCAN_OFF)
+        return;
 #endif
 
     APP_StartListening(gMonitor ? FUNCTION_MONITOR : FUNCTION_RECEIVE);
@@ -711,7 +792,7 @@ void APP_StartListening(FUNCTION_Type_t function)
         return;
 #endif
 
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
     if (gFmRadioMode)
         BK1080_Init0();
 #endif
@@ -776,7 +857,11 @@ void APP_StartListening(FUNCTION_Type_t function)
 
     FUNCTION_Select(function);
 
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FEAT_F4HWN_RXTX_LOG
+    RXTX_LOG_BeginRx(gRxVfo, function);
+#endif
+
+#ifdef ENABLE_FMRADIO_EMBEDDED
     if (function == FUNCTION_MONITOR || gFmRadioMode)
 #else
     if (function == FUNCTION_MONITOR)
@@ -993,36 +1078,44 @@ static void CheckRadioInterrupts(void)
             BK4819_ToggleGpioOut(BK4819_GPIO6_PIN2_GREEN, false);
         }
 
-#ifdef ENABLE_AIRCOPY
-        if (interrupts.fskFifoAlmostFull &&
-            gScreenToDisplay == DISPLAY_AIRCOPY &&
-            gAircopyState == AIRCOPY_TRANSFER &&
-            gAirCopyIsSendMode == 0)
+#if defined(ENABLE_AIRCOPY) || defined(ENABLE_FEAT_F4HWN_BEAM)
+        if (interrupts.fskFifoAlmostFull || interrupts.fskRxFinied)
         {
-            for (unsigned int i = 0; i < 4; i++) {
-                g_FSK_Buffer[gFSKWriteIndex++] = BK4819_ReadRegister(BK4819_REG_5F);
-            }
-
-            AIRCOPY_StorePacket();
-        }
-#endif
+            uint8_t fskTarget = 0;
 
 #ifdef ENABLE_FEAT_F4HWN_BEAM
-        if ((interrupts.fskFifoAlmostFull || interrupts.fskRxFinied) &&
-            gBeamActive &&
-            gBeamMode == BEAM_MODE_RX &&
-            (gBeamStatus == BEAM_STATUS_RX_WAIT || gBeamStatus == BEAM_STATUS_ERROR))
-        {
-            const unsigned int wordsToRead = interrupts.fskRxFinied ? (36 - gFSKWriteIndex) : 4;
-            for (unsigned int i = 0; i < wordsToRead; i++) {
-                const uint16_t word = BK4819_ReadRegister(BK4819_REG_5F);
-                if (gFSKWriteIndex < 36)
-                    g_FSK_Buffer[gFSKWriteIndex++] = word;
-            }
+            if (gBeamActive &&
+                gBeamMode == BEAM_MODE_RX &&
+                (gBeamStatus == BEAM_STATUS_RX_WAIT || gBeamStatus == BEAM_STATUS_ERROR))
+                fskTarget = 2;
+#endif
+#ifdef ENABLE_AIRCOPY
+            // Aircopy wins if stale state ever makes both receivers eligible.
+            if (gScreenToDisplay == DISPLAY_AIRCOPY &&
+                gAircopyState == AIRCOPY_TRANSFER)
+                fskTarget = 1;
+#endif
 
-            gBeamRxWordCount = gFSKWriteIndex;
-            gUpdateDisplay = true;
-            BEAM_StorePacket();
+            if (fskTarget != 0)
+            {
+                const unsigned int wordsToRead = interrupts.fskRxFinied
+                                               ? (gFSKWriteIndex < 36 ? 36u - gFSKWriteIndex : 0u)
+                                               : 4u;
+                for (unsigned int i = 0; i < wordsToRead; i++) {
+                    const uint16_t word = BK4819_ReadRegister(BK4819_REG_5F);
+                    if (gFSKWriteIndex < 36)
+                        g_FSK_Buffer[gFSKWriteIndex++] = word;
+                }
+
+#ifdef ENABLE_AIRCOPY
+                if (fskTarget == 1)
+                    AIRCOPY_StorePacket();
+#endif
+#ifdef ENABLE_FEAT_F4HWN_BEAM
+                if (fskTarget == 2)
+                    BEAM_StorePacket();
+#endif
+            }
         }
 #endif
     }
@@ -1078,7 +1171,7 @@ static void HandleVox(void)
         gVoxPauseCountdown = 0;
     }
 
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
     if (gFmRadioMode)
         return;
 #endif
@@ -1123,10 +1216,10 @@ static void HandleVox(void)
 
 void APP_Update(void)
 {
-#ifdef ENABLE_FEAT_F4HWN_SCREENSHOT
+#ifdef ENABLE_FEAT_F4HWN_K5VIEWER
     // Parse incoming packets on every tick so serial keys are never missed,
     // regardless of whether the screen needs redrawing.
-    SCREENSHOT_ParseInput();
+    K5VIEWER_ParseInput();
 #endif
 
 #ifdef ENABLE_VOICE
@@ -1240,16 +1333,18 @@ void APP_Update(void)
     if (gCurrentFunction != FUNCTION_TRANSMIT)
         HandleFunction();
 
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
 //  if (gFmRadioCountdown_500ms > 0)
     if (gFmRadioMode && gFmRadioCountdown_500ms > 0)    // 1of11
         return;
 #endif
 
 #ifdef ENABLE_VOICE
-    if (!SCANNER_IsScanning() && gScanStateDir != SCAN_OFF && gScheduleScanListen && !gPttIsPressed && gVoiceWriteIndex == 0)
+    if (!SCANNER_IsScanning() && gScanStateDir != SCAN_OFF && gScheduleScanListen && !gPttIsPressed && gVoiceWriteIndex == 0
+        && !UI_MAIN_ShouldHoldScanResume())
 #else
-    if (!SCANNER_IsScanning() && gScanStateDir != SCAN_OFF && gScheduleScanListen && !gPttIsPressed)
+    if (!SCANNER_IsScanning() && gScanStateDir != SCAN_OFF && gScheduleScanListen && !gPttIsPressed
+        && !UI_MAIN_ShouldHoldScanResume())
 #endif
     {   // scanning
         CHFRSCANNER_ContinueScanning();
@@ -1283,7 +1378,7 @@ void APP_Update(void)
 #ifdef ENABLE_VOICE
         && gVoiceWriteIndex == 0
 #endif
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
         && !gFmRadioMode
 #endif
 #ifdef ENABLE_DTMF_CALLING
@@ -1302,7 +1397,7 @@ void APP_Update(void)
         gScheduleDualWatch = false;
     }
 
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
     if (gScheduleFM && gFM_ScanState != FM_SCAN_OFF && !FUNCTION_IsRx()) {
         // switch to FM radio mode
         FM_Play();
@@ -1322,7 +1417,7 @@ void APP_Update(void)
             || gScanStateDir != SCAN_OFF
             || gCssBackgroundScan
             || gScreenToDisplay != DISPLAY_MAIN
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
             || gFmRadioMode
 #endif
 #ifdef ENABLE_DTMF_CALLING
@@ -1434,7 +1529,7 @@ void CheckKeys(void)
 #endif
 
 #ifdef ENABLE_AIRCOPY
-    if (gScreenToDisplay == DISPLAY_AIRCOPY && gAircopyState != AIRCOPY_READY){
+    if (gScreenToDisplay == DISPLAY_AIRCOPY && gAircopyState == AIRCOPY_TRANSFER){
         return;
     }
 #endif
@@ -1584,15 +1679,13 @@ void APP_TimeSlice10ms(void)
 
     SETTINGS_SaveVfoIndicesFlush();
 
+#ifdef ENABLE_FEAT_F4HWN_RXTX_LOG
+    RXTX_LOG_Task10ms();
+#endif
+
     BACKLIGHT_Update();
 
     gFlashLightBlinkCounter++;
-
-#ifdef ENABLE_AM_FIX
-    if (gRxVfo->Modulation == MODULATION_AM) {
-        AM_fix_10ms(gEeprom.RX_VFO);
-    }
-#endif
 
 #ifdef ENABLE_UART
     if (UART_IsCommandAvailable(UART_PORT_UART)) {
@@ -1605,8 +1698,17 @@ void APP_TimeSlice10ms(void)
     if (gReducedService)
         return;
 
+    UI_MAIN_TimeSlice10ms();   // scan-list name hold countdown (10 ms resolution)
+
     if (gCurrentFunction != FUNCTION_POWER_SAVE || !gRxIdleMode)
         CheckRadioInterrupts();
+#ifdef ENABLE_FEAT_F4HWN_ACTION_PICKER
+    if (gActionPickerKey != 0 && FUNCTION_IsRx()) {
+        gActionPickerKey = 0;
+        gUpdateDisplay = true;
+    }
+#endif
+
 
     if (gCurrentFunction == FUNCTION_TRANSMIT)
     {   // transmitting
@@ -1630,7 +1732,9 @@ void APP_TimeSlice10ms(void)
     }
 
 #ifdef ENABLE_FEAT_F4HWN_LOGO_SAV
+#ifdef ENABLE_FEAT_F4HWN_K5VIEWER
     bool screenSaverRendered = false;
+#endif
 
     if (gScreenSaverDisplayed) {
         if (gUpdateDisplayCurrent) {
@@ -1640,18 +1744,10 @@ void APP_TimeSlice10ms(void)
             gUpdateStatus = false;
         }
 
-        if (gSetting_set_sav == SET_SAV_MATRIX) {
-            if (++gScreenSaverTick >= 8u) {
-                gScreenSaverTick = 0;
-                ScreenSaverRenderMatrix(false);
-                screenSaverRendered = true;
-            }
-        } else if (gSetting_set_sav == SET_SAV_LOGO_PLUS) {
-            if (++gScreenSaverTick >= 16u) {
-                gScreenSaverTick = 0;
-                ScreenSaverRenderLogoPlus(false);
-                screenSaverRendered = true;
-            }
+        if (ScreenSaverAnimate()) {
+#ifdef ENABLE_FEAT_F4HWN_K5VIEWER
+            screenSaverRendered = true;
+#endif
         }
     }
 #endif
@@ -1664,21 +1760,21 @@ void APP_TimeSlice10ms(void)
         UI_DisplayStatus();
     }
 
-    #ifdef ENABLE_FEAT_F4HWN_SCREENSHOT
+    #ifdef ENABLE_FEAT_F4HWN_K5VIEWER
     if (gUpdateDisplayCurrent || gUpdateStatusCurrent
 #ifdef ENABLE_FEAT_F4HWN_LOGO_SAV
         || screenSaverRendered
 #endif
         ) {
-        SCREENSHOT_Update(false);
-    } else if (SCREENSHOT_HasPendingStateChange()) {
-        SCREENSHOT_Update(false);
+        K5VIEWER_Update(false);
+    } else if (K5VIEWER_HasPendingStateChange()) {
+        K5VIEWER_Update(false);
     }
     #endif
 
     // Skipping authentic device checks
 
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
     if (gFmRadioMode && gFmRadioCountdown_500ms > 0)   // 1of11
         return;
 #endif
@@ -1698,52 +1794,6 @@ void APP_TimeSlice10ms(void)
 #endif
 
     if (gCurrentFunction == FUNCTION_TRANSMIT) {
-#ifdef ENABLE_ALARM
-        if (gAlarmState == ALARM_STATE_TXALARM || gAlarmState == ALARM_STATE_SITE_ALARM) {
-            uint16_t Tone;
-
-            gAlarmRunningCounter++;
-            gAlarmToneCounter++;
-
-            Tone = 500 + (gAlarmToneCounter * 25);
-            if (Tone > 1500) {
-                Tone              = 500;
-                gAlarmToneCounter = 0;
-            }
-
-            BK4819_SetScrambleFrequencyControlWord(Tone);
-
-            if (gEeprom.ALARM_MODE == ALARM_MODE_TONE && gAlarmRunningCounter == 512) {
-                gAlarmRunningCounter = 0;
-
-                if (gAlarmState == ALARM_STATE_TXALARM) {
-                    gAlarmState = ALARM_STATE_SITE_ALARM;
-
-                    RADIO_SendCssTail();
-                    BK4819_SetupPowerAmplifier(0, 0);
-                    BK4819_ToggleGpioOut(BK4819_GPIO1_PIN29_PA_ENABLE, false);
-                    BK4819_Enable_AfDac_DiscMode_TxDsp();
-                    BK4819_ToggleGpioOut(BK4819_GPIO5_PIN1_RED, false);
-
-                    GUI_DisplayScreen();
-                }
-                else {
-                    gAlarmState = ALARM_STATE_TXALARM;
-
-                    GUI_DisplayScreen();
-
-                    BK4819_ToggleGpioOut(BK4819_GPIO5_PIN1_RED, true);
-                    RADIO_SetTxParameters();
-                    BK4819_TransmitTone(true, 500);
-                    SYSTEM_DelayMs(2);
-                    AUDIO_AudioPathOn();
-
-                    gEnableSpeaker    = true;
-                    gAlarmToneCounter = 0;
-                }
-            }
-        }
-#endif
         // repeater tail tone elimination
         if (gRTTECountdown_10ms > 0) {
             if (--gRTTECountdown_10ms == 0) {
@@ -1756,7 +1806,7 @@ void APP_TimeSlice10ms(void)
         }
     }
 
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
     if (gFmRadioMode && gFM_RestoreCountdown_10ms > 0) {
         if (--gFM_RestoreCountdown_10ms == 0) { 
             FM_Start(); // switch back to FM radio mode
@@ -1773,7 +1823,7 @@ void APP_TimeSlice10ms(void)
 #endif
 
 #ifdef ENABLE_AIRCOPY
-    if (gScreenToDisplay == DISPLAY_AIRCOPY && gAircopyState == AIRCOPY_TRANSFER && gAirCopyIsSendMode == 1) {
+    if (gScreenToDisplay == DISPLAY_AIRCOPY && gAircopyState == AIRCOPY_TRANSFER) {
         if (!AIRCOPY_SendMessage()) {
             GUI_DisplayScreen();
         }
@@ -1806,6 +1856,15 @@ void cancelUserInputModes(void)
 void APP_TimeSlice500ms(void)
 {
     gNextTimeslice_500ms = false;
+#ifdef ENABLE_FEAT_F4HWN_ACTION_PICKER
+    if (gActionPickerKey != 0 && gActionPickerTimeout_500ms > 0 &&
+        --gActionPickerTimeout_500ms == 0)
+    {
+        gActionPickerKey = 0;
+        gUpdateDisplay = true;
+    }
+#endif
+
     bool exit_menu = false;
 
     // Skipped authentic device check
@@ -1813,6 +1872,10 @@ void APP_TimeSlice500ms(void)
     if (gKeypadLocked > 0)
         if (--gKeypadLocked == 0)
             gUpdateDisplay = true;
+
+#ifdef ENABLE_FEAT_F4HWN_RXTX_LOG
+    RXTX_LOG_Tick500ms();
+#endif
 
 #ifdef ENABLE_FEAT_F4HWN_RX_TX_TIMER
     if (gSetting_set_tmr && (gCurrentFunction == FUNCTION_TRANSMIT || FUNCTION_IsRx())) {
@@ -1831,7 +1894,7 @@ void APP_TimeSlice500ms(void)
         {
 
             if (IS_MR_CHANNEL(gTxVfo->CHANNEL_SAVE) && (gInputBoxIndex > 0 && gInputBoxIndex < 4)
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
                 && (!gFmRadioMode)
 #endif
                 )
@@ -1878,7 +1941,7 @@ void APP_TimeSlice500ms(void)
 
     // Skipped authentic device check
 
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
     if (gFmRadioCountdown_500ms > 0)
     {
         gFmRadioCountdown_500ms--;
@@ -1897,7 +1960,7 @@ void APP_TimeSlice500ms(void)
     ) {
         BACKLIGHT_TurnOff();
 #ifdef ENABLE_FEAT_F4HWN_LOGO_SAV
-        ScreenSaverTryDisplay();
+        ScreenSaverTryDisplay(false);
 #endif
     }
 
@@ -1987,10 +2050,14 @@ void APP_TimeSlice500ms(void)
 
         if ((gBatteryCheckCounter & 1) == 0)
         {
+#if defined(ENABLE_FEAT_F4HWN_OVERLAY_APPS) || defined(ENABLE_FEAT_F4HWN_FOXHUNT) || defined(ENABLE_FEAT_F4HWN_BEACON)
+            BATTERY_Sample(true);
+#else
             BOARD_ADC_GetBatteryInfo(&gBatteryVoltages[gBatteryVoltageIndex++], &gBatteryCurrent);
             if (gBatteryVoltageIndex > 3)
                 gBatteryVoltageIndex = 0;
             BATTERY_GetReadings(true);
+#endif
         }
     }
 
@@ -2006,7 +2073,7 @@ void APP_TimeSlice500ms(void)
     }
 
     if (!gCssBackgroundScan && gScanStateDir == SCAN_OFF && !SCANNER_IsScanning()
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
         && (gFM_ScanState == FM_SCAN_OFF || gAskToSave)
 #endif
 #ifdef ENABLE_AIRCOPY
@@ -2021,6 +2088,10 @@ void APP_TimeSlice500ms(void)
         {
             gEeprom.KEY_LOCK = true;     // lock the keyboard
             gUpdateStatus = true;            // lock symbol needs showing
+#ifdef ENABLE_FEAT_F4HWN_ACTION_PICKER
+            gActionPickerKey = 0;
+            gUpdateDisplay = true;
+#endif
         }
 
         if (exit_menu) {
@@ -2057,7 +2128,7 @@ void APP_TimeSlice500ms(void)
 
             GUI_DisplayType_t disp = DISPLAY_INVALID;
 
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
             if (gFmRadioMode && ! FUNCTION_IsRx()) {
                 disp = DISPLAY_FM;
             }
@@ -2079,7 +2150,7 @@ void APP_TimeSlice500ms(void)
 
     if (!gPttIsPressed && gVFOStateResumeCountdown_500ms > 0 && --gVFOStateResumeCountdown_500ms == 0) {
             RADIO_SetVfoState(VFO_STATE_NORMAL);
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
         if (gFmRadioMode && !FUNCTION_IsRx()) {
             // switch back to FM radio mode
             FM_Start();
@@ -2095,7 +2166,7 @@ void APP_TimeSlice500ms(void)
         !gAskToSave &&
         !gCssBackgroundScan)
     {
-        ScreenSaverTryDisplay();
+        ScreenSaverTryDisplay(false);
     }
 #endif
 
@@ -2133,17 +2204,15 @@ void APP_TimeSlice500ms(void)
 #endif
 }
 
-#if defined(ENABLE_ALARM) || defined(ENABLE_TX1750)
-static void ALARM_Off(void)
+#ifdef ENABLE_TX1750
+static void TX1750_Off(void)
 {
     AUDIO_AudioPathOff();
     gEnableSpeaker = false;
 
-    if (gAlarmState == ALARM_STATE_TXALARM || gAlarmState == ALARM_STATE_TX1750) {
-        RADIO_SendEndOfTransmission();
-    }
+    RADIO_SendEndOfTransmission();
 
-    gAlarmState = ALARM_STATE_OFF;
+    gTx1750Active = false;
 
 #ifdef ENABLE_VOX
     gVoxResumeCountdown = 80;
@@ -2234,7 +2303,7 @@ static void ProcessKey(KEY_Code_t Key, bool bKeyPressed, bool bKeyHeld)
             flagSaveSettings = false;
         }
 
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
         if (gFlagSaveFM) {
             SETTINGS_SaveFM();
             gFlagSaveFM = false;
@@ -2261,7 +2330,11 @@ static void ProcessKey(KEY_Code_t Key, bool bKeyPressed, bool bKeyHeld)
             BACKLIGHT_TurnOn();
         }
 
-        if (Key == KEY_EXIT && bKeyHeld) { // exit key held pressed
+        if (Key == KEY_EXIT && bKeyHeld
+#ifdef ENABLE_FEAT_F4HWN_ACTION_PICKER
+            && gActionPickerKey == 0
+#endif
+        ) { // exit key held pressed
             // clear the live DTMF decoder
             if (gDTMF_RX_live[0] != 0) {
                 DTMF_clear_input_box_memory();
@@ -2298,11 +2371,19 @@ static void ProcessKey(KEY_Code_t Key, bool bKeyPressed, bool bKeyHeld)
     }
 
     bool lowBatPopup = gLowBattery && !gLowBatteryConfirmed &&  gScreenToDisplay == DISPLAY_MAIN;
+#ifdef ENABLE_FEAT_F4HWN_ACTION_PICKER
+    if (gActionPickerKey != 0 &&
+        (gEeprom.KEY_LOCK || lowBatPopup || gScreenToDisplay != DISPLAY_MAIN))
+        gActionPickerKey = 0;
+    if (ACTION_PickerProcessKey(Key, bKeyPressed, bKeyHeld))
+        goto Skip;
+#endif
+
 
 #ifdef ENABLE_FEAT_F4HWN // Disable PTT if KEY_LOCK
     bool lck_condition = (gEeprom.KEY_LOCK || lowBatPopup) && gCurrentFunction != FUNCTION_TRANSMIT;
 
-    if(!gSetting_set_lck)
+    if((gSetting_set_lck & SET_LCK_PTT) == 0)
         lck_condition = lck_condition && Key != KEY_PTT;
 
     if (lck_condition)
@@ -2319,6 +2400,12 @@ static void ProcessKey(KEY_Code_t Key, bool bKeyPressed, bool bKeyHeld)
             return;
         }
 
+        // The ACTIONS restriction only applies when the keypad is actually
+        // locked: this block is also entered for the low battery popup, where
+        // action keys must keep working as before
+        const bool passActionKey = ((gSetting_set_lck & SET_LCK_ACTIONS) == 0 || !gEeprom.KEY_LOCK) &&
+                                   (Key == KEY_SIDE1 || Key == KEY_SIDE2 || (Key == KEY_MENU && bKeyHeld));
+
         if (Key == KEY_F) { // function/key-lock key
             if (!bKeyPressed)
                 return;
@@ -2333,8 +2420,7 @@ static void ProcessKey(KEY_Code_t Key, bool bKeyPressed, bool bKeyHeld)
         // KEY_MENU has a special treatment here, because we want to pass hold event to ACTION_Handle
         // but we don't want it to complain when initial press happens
         // we want to react on realese instead
-        else if (Key != KEY_SIDE1 && Key != KEY_SIDE2 &&        // pass side buttons
-                 !(Key == KEY_MENU && bKeyHeld)) // pass KEY_MENU held
+        else if (!passActionKey)
         {
             if ((!bKeyPressed || bKeyHeld || (Key == KEY_MENU && bKeyPressed)) && // prevent released or held, prevent KEY_MENU pressed
                 !(Key == KEY_MENU && !bKeyPressed))  // pass KEY_MENU released
@@ -2390,8 +2476,8 @@ static void ProcessKey(KEY_Code_t Key, bool bKeyPressed, bool bKeyHeld)
     }
 
     if (gCurrentFunction == FUNCTION_TRANSMIT) {
-#if defined(ENABLE_ALARM) || defined(ENABLE_TX1750)
-        if (gAlarmState == ALARM_STATE_OFF)
+#ifdef ENABLE_TX1750
+        if (!gTx1750Active)
 #endif
         {
             char Code;
@@ -2443,10 +2529,9 @@ static void ProcessKey(KEY_Code_t Key, bool bKeyPressed, bool bKeyHeld)
                     BK4819_PlayDTMFEx(gEeprom.DTMF_SIDE_TONE, Code);
             }
         }
-#if defined(ENABLE_ALARM) || defined(ENABLE_TX1750)
-        // else if ((!bKeyHeld && bKeyPressed) || (gAlarmState == ALARM_STATE_TX1750 && bKeyHeld && !bKeyPressed)) {
-        else if ((bKeyHeld != bKeyPressed) && (gAlarmState == ALARM_STATE_TX1750 || bKeyPressed)) {
-            ALARM_Off();
+#ifdef ENABLE_TX1750
+        else if (bKeyHeld != bKeyPressed) {
+            TX1750_Off();
 
             if (gEeprom.REPEATER_TAIL_TONE_ELIMINATION == 0)
                 FUNCTION_Select(FUNCTION_FOREGROUND);
@@ -2512,7 +2597,7 @@ Skip:
         gUpdateStatus        = true;
     }
 
-#ifdef ENABLE_FMRADIO
+#ifdef ENABLE_FMRADIO_EMBEDDED
     if (gRequestSaveFM) {
         gRequestSaveFM = false;
         if (!bKeyHeld)
@@ -2594,7 +2679,10 @@ Skip:
         gFlagRefreshSetting = false;
         gMenuCountdown      = menu_timeout_500ms;
 
-        MENU_ShowCurrentSetting();
+#ifdef ENABLE_FEAT_F4HWN_MENU_CAT
+        if (gMenuLevel != MENU_LEVEL_CAT)
+#endif
+            MENU_ShowCurrentSetting();
     }
 
     if (gFlagPrepareTX) {

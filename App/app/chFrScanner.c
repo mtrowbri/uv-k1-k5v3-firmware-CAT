@@ -29,7 +29,7 @@ static uint8_t    scanRangeCssCandidate = 0xFF;
 static uint8_t    scanRangeCssHitCount  = 0;
 #endif
 
-#define SCAN_RANGE_SKIP_MAX 32
+#define SCAN_RANGE_SKIP_MAX 64
 #if (SCAN_RANGE_SKIP_MAX & (SCAN_RANGE_SKIP_MAX - 1)) != 0
     #error SCAN_RANGE_SKIP_MAX must be a power of two
 #endif
@@ -553,11 +553,7 @@ static void ScanFastApplyChannelShape(ModulationMode_t modulation)
     }
     else
     {
-#ifdef ENABLE_AM_FIX
-        BK4819_SetFilterBandwidth(BK4819_FILTER_BW_WIDE, true);
-#else
         BK4819_SetFilterBandwidth(BK4819_FILTER_BW_WIDE, false);
-#endif
     }
 
     if (modulationChanged)
@@ -771,12 +767,16 @@ void CHFRSCANNER_Start(const bool storeBackupSettings, const int8_t scan_directi
 #endif
 
     if (IS_MR_CHANNEL(gNextMrChannel))
-    {   
+    {
+        bool scanListChanged = false;
 
         if(!RADIO_CheckValidList(gEeprom.SCAN_LIST_DEFAULT)) {
             RADIO_NextValidList(1);
-            UI_MAIN_NotifyScanProgressDataChanged();
+            scanListChanged = true;
         }
+
+        if (storeBackupSettings || scanListChanged)
+            UI_MAIN_NotifyScanListChanged();
 
         // channel mode
         if (storeBackupSettings) {
@@ -1129,7 +1129,9 @@ static void NextMemChannel(void)
 
     if (!enabled || chan == 0xFFFF)
     {
+#ifdef ENABLE_FEAT_F4HWN_SCAN_FASTER
         const uint16_t searchStart = gNextMrChannel;
+#endif
         chan = RADIO_FindNextChannel(gNextMrChannel + gScanStateDir, gScanStateDir, true, gEeprom.SCAN_LIST_DEFAULT);
         if (chan == 0xFFFF)
         {   // no valid channel found -> wrapping back to the first channel

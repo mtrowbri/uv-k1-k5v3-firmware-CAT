@@ -30,6 +30,10 @@
 #include "driver/eeprom.h"
 #include "driver/gpio.h"
 #include "driver/keyboard.h"
+#ifdef ENABLE_FEAT_F4HWN_MULTIBOOT
+    #include "driver/mb_flash.h"
+    #include "ui/multiboot.h"
+#endif
 #include "frequencies.h"
 #include "helper/battery.h"
 #include "misc.h"
@@ -68,7 +72,7 @@ uint8_t gUnlockAllTxConfCnt;
             //
             EEPROM_ReadBuffer(0x1F88, &misc, 8);
             misc.BK4819_XtalFreqLow = value;
-            EEPROM_WriteBuffer(0x1F88, &misc);
+            EEPROM_WriteBuffer(0x1F88, &misc, 8);
         }
     }
 #endif
@@ -85,10 +89,10 @@ void MENU_StartCssScan(void)
 void MENU_CssScanFound(void)
 {
     if(gScanCssResultType == CODE_TYPE_DIGITAL || gScanCssResultType == CODE_TYPE_REVERSE_DIGITAL) {
-        gMenuCursor = UI_MENU_GetMenuIdx(MENU_R_DCS);
+        gMenuCursor = UI_MENU_GetViewPos(MENU_R_DCS);
     }
     else if(gScanCssResultType == CODE_TYPE_CONTINUOUS_TONE) {
-        gMenuCursor = UI_MENU_GetMenuIdx(MENU_R_CTCS);
+        gMenuCursor = UI_MENU_GetViewPos(MENU_R_CTCS);
     }
 
     MENU_ShowCurrentSetting();
@@ -204,17 +208,17 @@ int MENU_GetLimits(uint8_t menu_id, int32_t *pMin, int32_t *pMax)
             *pMax = ARRAY_SIZE(gSubMenu_W_N) - 1;
             break;
 
-        #ifdef ENABLE_ALARM
-            case MENU_AL_MOD:
-                //*pMin = 0;
-                *pMax = ARRAY_SIZE(gSubMenu_AL_MOD) - 1;
-                break;
-        #endif
-
         case MENU_RESET:
             //*pMin = 0;
             *pMax = ARRAY_SIZE(gSubMenu_RESET) - 1;
             break;
+
+#ifdef ENABLE_FEAT_F4HWN_MULTIBOOT
+        case MENU_SET_CFG:
+            //*pMin = 0;
+            *pMax = MB_BANK_COUNT - 1;
+            break;
+#endif
 
         case MENU_COMPAND:
         case MENU_ABR_ON_TX_RX:
@@ -229,11 +233,6 @@ int MENU_GetLimits(uint8_t menu_id, int32_t *pMin, int32_t *pMax)
             break;
 #endif
 
-        #ifndef ENABLE_FEAT_F4HWN
-            #ifdef ENABLE_AM_FIX
-                case MENU_AM_FIX:
-            #endif
-        #endif
         #ifdef ENABLE_AUDIO_BAR
             case MENU_MIC_BAR:
         #endif
@@ -426,7 +425,7 @@ int MENU_GetLimits(uint8_t menu_id, int32_t *pMin, int32_t *pMax)
         #endif
         case MENU_SET_LCK:
             //*pMin = 0;
-            *pMax = ARRAY_SIZE(gSubMenu_SET_LCK) - 1;
+            *pMax = SET_LCK_LEN - 1;
             break;
         case MENU_SET_MET:
         case MENU_SET_GUI:
@@ -725,7 +724,7 @@ void MENU_AcceptSetting(void)
 
         case MENU_LIST_CH:
             gTxVfo->SCANLIST_PARTICIPATION = gSubMenuSelection;
-            SETTINGS_UpdateChannel(gTxVfo->CHANNEL_SAVE, gTxVfo, true, false, true);
+            SETTINGS_UpdateChannel(gTxVfo->CHANNEL_SAVE, gTxVfo, true);
             gVfoConfigureMode = VFO_CONFIGURE;
             gFlagResetVfos    = true;
             return;
@@ -752,7 +751,7 @@ void MENU_AcceptSetting(void)
 
         case MENU_COMPAND:
             gTxVfo->Compander = gSubMenuSelection;
-            SETTINGS_UpdateChannel(gTxVfo->CHANNEL_SAVE, gTxVfo, true, false, true);
+            SETTINGS_UpdateChannel(gTxVfo->CHANNEL_SAVE, gTxVfo, true);
             gVfoConfigureMode = VFO_CONFIGURE;
             gFlagResetVfos    = true;
 //          gRequestSaveChannel = 1;
@@ -769,12 +768,6 @@ void MENU_AcceptSetting(void)
         case MENU_S_PRI:
             gEeprom.SCAN_LIST_ENABLED = gSubMenuSelection;
             break;
-
-        #ifdef ENABLE_ALARM
-            case MENU_AL_MOD:
-                gEeprom.ALARM_MODE = gSubMenuSelection;
-                break;
-        #endif
 
         case MENU_D_ST:
             gEeprom.DTMF_SIDE_TONE = gSubMenuSelection;
@@ -846,16 +839,6 @@ void MENU_AcceptSetting(void)
             gRequestSaveChannel = 1;
             return;
 
-        #ifndef ENABLE_FEAT_F4HWN
-            #ifdef ENABLE_AM_FIX
-                case MENU_AM_FIX:
-                    gSetting_AM_fix = gSubMenuSelection;
-                    gVfoConfigureMode = VFO_CONFIGURE_RELOAD;
-                    gFlagResetVfos    = true;
-                    break;
-            #endif
-        #endif
-
         #ifdef ENABLE_NOAA
             case MENU_NOAA_S:
                 gEeprom.NOAA_AUTO_SCAN = gSubMenuSelection;
@@ -864,7 +847,7 @@ void MENU_AcceptSetting(void)
         #endif
 
         case MENU_DEL_CH:
-            SETTINGS_UpdateChannel(gSubMenuSelection, NULL, false, false, true);
+            SETTINGS_UpdateChannel(gSubMenuSelection, NULL, false);
             gVfoConfigureMode = VFO_CONFIGURE_RELOAD;
             gFlagResetVfos    = true;
             return;
@@ -1092,6 +1075,12 @@ void MENU_ShowCurrentSetting(void)
             gSubMenuSelection = 0;
             break;
 
+#ifdef ENABLE_FEAT_F4HWN_MULTIBOOT
+        case MENU_SET_CFG:
+            gSubMenuSelection = MB_GetActiveBank();
+            break;
+#endif
+
         case MENU_R_DCS:
         case MENU_R_CTCS:
         {
@@ -1290,12 +1279,6 @@ void MENU_ShowCurrentSetting(void)
             gSubMenuSelection = gEeprom.SCANLIST_PRIORITY_CH[1];
             break;
 
-        #ifdef ENABLE_ALARM
-            case MENU_AL_MOD:
-                gSubMenuSelection = gEeprom.ALARM_MODE;
-                break;
-        #endif
-
         case MENU_D_ST:
             gSubMenuSelection = gEeprom.DTMF_SIDE_TONE;
             break;
@@ -1346,14 +1329,6 @@ void MENU_ShowCurrentSetting(void)
             gSubMenuSelection = gTxVfo->Modulation;
             break;
 
-#ifndef ENABLE_FEAT_F4HWN
-    #ifdef ENABLE_AM_FIX
-            case MENU_AM_FIX:
-                gSubMenuSelection = gSetting_AM_fix;
-                break;
-    #endif
-#endif
-                
         #ifdef ENABLE_NOAA
             case MENU_NOAA_S:
                 gSubMenuSelection = gEeprom.NOAA_AUTO_SCAN;
@@ -1607,6 +1582,36 @@ static void MENU_Key_0_to_9(KEY_Code_t Key, bool bKeyPressed, bool bKeyHeld)
 
     gRequestDisplayScreen = DISPLAY_MENU;
 
+#ifdef ENABLE_FEAT_F4HWN_MENU_CAT
+    if (gMenuLevel == MENU_LEVEL_CAT)
+    {   // saut-par-numero global : depuis l'ecran categories, entre dans All a l'item N
+        const uint8_t allCount = UI_MENU_CategoryItemCount(CAT_ALL);
+        uint16_t value;
+
+        if (gInputBoxIndex >= 2) {
+            gInputBoxIndex = 0;
+            value = (gInputBox[0] * 10) + gInputBox[1];
+        } else {
+            value = gInputBox[0];
+        }
+
+        if (value > 0 && value <= allCount)
+        {
+            gMenuCategory  = CAT_ALL;
+            gMenuCatCursor = gMenuListCount - 1;   // All = derniere entree de gCatOrder
+            UI_MENU_BuildView();
+            gMenuLevel     = MENU_LEVEL_ITEMS;
+            gMenuCursor    = value - 1;
+            gFlagRefreshSetting = true;
+        }
+        else if (gInputBoxIndex == 0)
+        {
+            gBeepToPlay = BEEP_500HZ_60MS_DOUBLE_BEEP_OPTIONAL;
+        }
+        return;
+    }
+#endif
+
     if (!gIsInSubMenu)
     {
         switch (gInputBoxIndex)
@@ -1821,6 +1826,22 @@ Skip:
             return;
         }
 
+#ifdef ENABLE_FEAT_F4HWN_MENU_CAT
+        if (gMenuLevel == MENU_LEVEL_ITEMS)
+        {   // remonter aux categories au lieu de quitter le menu
+            gCatLastPos[gMenuCategory] = gMenuCursor;   // memorise la position dans la categorie
+            gMenuLevel  = MENU_LEVEL_CAT;
+            UI_MENU_BuildCategoryScreen();
+            gMenuCursor = gMenuCatCursor;
+            gRequestDisplayScreen = DISPLAY_MENU;
+            #ifdef ENABLE_VOICE
+                gAnotherVoiceID = VOICE_ID_CANCEL;
+            #endif
+            gPttWasReleased = true;
+            return;
+        }
+#endif
+
         #ifdef ENABLE_VOICE
             gAnotherVoiceID = VOICE_ID_CANCEL;
         #endif
@@ -1854,13 +1875,28 @@ static void MENU_Key_MENU(const bool bKeyPressed, const bool bKeyHeld)
     gBeepToPlay           = BEEP_1KHZ_60MS_OPTIONAL;
     gRequestDisplayScreen = DISPLAY_MENU;
 
+#ifdef ENABLE_FEAT_F4HWN_MENU_CAT
+    if (gMenuLevel == MENU_LEVEL_CAT)
+    {   // niveau categories : MENU descend dans la categorie choisie
+        gMenuCatCursor = gMenuCursor;
+        gMenuCategory  = gCatOrder[gMenuCursor];
+
+        UI_MENU_BuildView();
+        gMenuLevel   = MENU_LEVEL_ITEMS;
+        gMenuCursor  = (gCatLastPos[gMenuCategory] < gMenuListCount) ? gCatLastPos[gMenuCategory] : 0;
+        gIsInSubMenu = false;
+        gFlagRefreshSetting = true;
+        return;
+    }
+#endif
+
     if (!gIsInSubMenu)
     {
         const int m = UI_MENU_GetCurrentMenuId();
 
         #ifdef ENABLE_VOICE
             if (m != MENU_SCR)
-                gAnotherVoiceID = MenuList[gMenuCursor].voice_id;
+                gAnotherVoiceID = MenuList[gMenuIndices[gMenuCursor]].voice_id;
         #endif
         if (m == MENU_UPCODE 
             || m == MENU_DWCODE 
@@ -1945,6 +1981,9 @@ static void MENU_Key_MENU(const bool bKeyPressed, const bool bKeyHeld)
         if (m == MENU_RESET  ||
             m == MENU_MEM_CH ||
             m == MENU_DEL_CH ||
+#ifdef ENABLE_FEAT_F4HWN_MULTIBOOT
+            m == MENU_SET_CFG ||
+#endif
             m == MENU_MEM_NAME)
         {
             switch (gAskForConfirmation)
@@ -1973,6 +2012,40 @@ static void MENU_Key_MENU(const bool bKeyPressed, const bool bKeyHeld)
                             NVIC_SystemReset();
                         #endif
                     }
+#ifdef ENABLE_FEAT_F4HWN_MULTIBOOT
+                    else if (m == MENU_SET_CFG)
+                    {
+                        /* Bind the chosen config bank, then reboot so it is mapped
+                         * before any settings are read. Confirming the current bank
+                         * is a no-op: do not wear a marker sector or reboot. */
+                        if (gSubMenuSelection == MB_GetActiveBank())
+                        {
+                            gFlagAcceptSetting  = false;
+                            gIsInSubMenu        = false;
+                            gAskForConfirmation = 0;
+                            SCANNER_Stop();
+                            return;
+                        }
+
+                        const uint8_t err = MB_SetActiveBank(gSubMenuSelection);
+                        if (err != MB_OK)
+                        {
+                            /* The previous redundant marker remains authoritative.
+                             * Explain the failure and keep the selector open. */
+                            UI_MultibootShowConfigError(err);
+                            gAskForConfirmation   = 0;
+                            gRequestDisplayScreen = DISPLAY_MENU;
+                            SCANNER_Stop();
+                            return;
+                        }
+
+                        #if defined(ENABLE_OVERLAY)
+                            overlay_FLASH_RebootToBootloader();
+                        #else
+                            NVIC_SystemReset();
+                        #endif
+                    }
+#endif
 
                     gFlagAcceptSetting  = true;
                     gIsInSubMenu        = false;
@@ -2059,6 +2132,16 @@ static void MENU_Key_UP_DOWN(bool bKeyPressed, bool bKeyHeld, int8_t Direction)
         gInputBoxIndex = 0;
         gBeepToPlay = BEEP_1KHZ_60MS_OPTIONAL;
     }
+
+#ifdef ENABLE_FEAT_F4HWN_MENU_CAT
+    if (gMenuLevel == MENU_LEVEL_CAT)
+    {   // niveau categories : deplacement simple du curseur
+        gMenuCursor = NUMBER_AddWithWraparound(gMenuCursor, -Direction, 0, gMenuListCount - 1);
+        gFlagRefreshSetting = true;   // rearme le timeout menu (ShowCurrentSetting saute au niveau CAT)
+        gRequestDisplayScreen = DISPLAY_MENU;
+        return;
+    }
+#endif
 
     if (!gEeprom.SET_NAV && gIsInSubMenu) {
         Direction = -Direction;
