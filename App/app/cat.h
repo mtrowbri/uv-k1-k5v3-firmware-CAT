@@ -1,8 +1,5 @@
 /*
  * cat.h: Helper functions for computer aided tuning (CAT)
- *
- *  Created on: Jun 22, 2026
- *      Author: mtrowbri
  */
 
 #ifndef APP_CAT_H_

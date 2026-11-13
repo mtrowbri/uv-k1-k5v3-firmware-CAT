@@ -1,10 +1,3 @@
-/*
- * cat.c
- *
- *  Created on: Jun 22, 2026
- *      Author: mtrowbri
- */
-
 #include <string.h>
 
 #include "cat.h"
