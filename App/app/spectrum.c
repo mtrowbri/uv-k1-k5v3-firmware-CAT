@@ -14,9 +14,12 @@
  *     limitations under the License.
  */
 #include "app/spectrum.h"
-#include "am_fix.h"
 #include "audio.h"
 #include "misc.h"
+
+#if defined(ENABLE_UART) || defined(ENABLE_USB)
+#include "app/uart.h"
+#endif
 
 #ifdef ENABLE_SCAN_RANGES
 #include "chFrScanner.h"
@@ -27,8 +30,8 @@
 #include "ui/helper.h"
 #include "ui/main.h"
 
-#ifdef ENABLE_FEAT_F4HWN_SCREENSHOT
-#include "screenshot.h"
+#ifdef ENABLE_FEAT_F4HWN_K5VIEWER
+#include "k5viewer.h"
 #endif
 
 #ifdef ENABLE_FEAT_F4HWN_SPECTRUM
@@ -73,7 +76,7 @@ static uint16_t blacklistFreqs[15];
 static uint8_t blacklistFreqsIdx;
 #endif
 
-const char *bwOptions[] = {"25", "12.5", "6.25"};
+const char *const bwOptions[] = {"25", "12.5", "6.25"};
 const uint8_t modulationTypeTuneSteps[] = {100, 50, 10};
 const uint8_t modTypeReg47Values[] = {1, 7, 5};
 
@@ -176,7 +179,7 @@ char freqInputString[11];
 uint8_t menuState = 0;
 uint16_t listenT = 0;
 
-RegisterSpec registerSpecs[] = {
+const RegisterSpec registerSpecs[] = {
     {},
     {"LNAs", BK4819_REG_13, 8, 0b11, 1},
     {"LNA", BK4819_REG_13, 5, 0b111, 1},
@@ -604,10 +607,6 @@ uint16_t GetRssi()
     // Discard first read (AGC may still be transitioning), keep second
     BK4819_GetRSSI();
     uint16_t rssi = BK4819_GetRSSI();
-#ifdef ENABLE_AM_FIX
-    if (settings.modulationType == MODULATION_AM && gSetting_AM_fix)
-        rssi += AM_fix_get_gain_diff() * 2;
-#endif
     return rssi;
 }
 
@@ -2461,21 +2460,15 @@ static void UpdateListening()
 
 static void Tick()
 {
-#ifdef ENABLE_FEAT_F4HWN_SCREENSHOT
+#ifdef ENABLE_FEAT_F4HWN_K5VIEWER
     // Parse incoming packets on every tick so serial keys are never missed,
     // regardless of whether the screen needs redrawing.
-    SCREENSHOT_ParseInput();
+    K5VIEWER_ParseInput();
 #endif
 
     if (gNextTimeslice)
     {
         gNextTimeslice = false;
-#ifdef ENABLE_AM_FIX
-        if (settings.modulationType == MODULATION_AM && !lockAGC)
-        {
-            AM_fix_10ms(vfo); // allow AM_Fix to apply its AGC action
-        }
-#endif
         BACKLIGHT_Update();
     }
 
@@ -2532,9 +2525,9 @@ static void Tick()
     if (redrawScreen || ++renderTimer >= RENDER_PERIOD_TICKS)
     {
         Render();
-        // For screenshot
-        #ifdef ENABLE_FEAT_F4HWN_SCREENSHOT
-            SCREENSHOT_Update(false);
+        // For K5Viewer
+        #ifdef ENABLE_FEAT_F4HWN_K5VIEWER
+            K5VIEWER_Update(false);
         #endif
         redrawScreen = false;
         renderTimer = 0;
@@ -2608,6 +2601,9 @@ void APP_RunSpectrum()
 
     while (isInitialized)
     {
+#if defined(ENABLE_UART) || defined(ENABLE_USB)
+        UART_ServiceCommands();
+#endif
         Tick();
     }
 
